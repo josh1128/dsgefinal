@@ -7,10 +7,6 @@
 #      - Shocks: IS, Phillips, and Taylor (tightening/easing)
 #      - Policy shock behavior selector
 #      - LaTeX equations shown below charts
-#      - Option A: theory-consistent coefficients for simulation (sign clipping)
-#      - Option C: robust shock routing + local-jump override
-#      - Neutral anchor: i* calibrated to converge to chosen neutral rate
-#      - NEW: Monetary transmission floor (ensures easing raises activity)
 #   2) Simple NK (built-in)
 # -----------------------------------------------------------
 
@@ -66,7 +62,7 @@ def row_from_params(params_index: pd.Index, values: Dict[str, float]) -> pd.Data
     return pd.DataFrame([row], columns=cols)
 
 def predict_with_params(row_df: pd.DataFrame, beta: pd.Series) -> float:
-    """Predict y using a *single-row* DataFrame and a coefficient Series aligned by column name."""
+    # row_df: single row with cols aligned to beta.index
     x = row_df[beta.index].iloc[0].values.astype(float)
     b = beta.values.astype(float)
     return float(np.dot(x, b))
@@ -216,14 +212,6 @@ with st.sidebar:
         with st.expander("Taylor Rule regressors", expanded=True):
             tr_selected = st.multiselect("Use these variables in the Taylor (partial adjustment) regression:", TR_ALL, default=TR_ALL, key="tr_vars")
 
-        st.divider()
-        # -------- Monetary transmission floor (NEW) --------
-        mon_pass_floor_pp = st.slider(
-            "Min Δg from −100 bp (pp)",
-            0.00, 0.50, 0.05, 0.01,
-            help="Floor on policy→activity pass-through: a 100 bp rate cut must raise quarterly GDP growth by at least this many percentage points (after the 2q lag in the IS)."
-        )
-
     else:
         st.info("**Mapping:** IS→(σ, ρx, ρr) • Phillips→(κ, γπ, ρu) • Taylor→(φπ, φx, ρi)")
         st.header("Simple NK parameters (pp units)")
@@ -311,31 +299,26 @@ def _clip_and_recentre(beta_raw: pd.Series, means: Dict[str, float], rules: Dict
     Clip selected coefficients per rules and adjust constant so that E[y] is preserved.
     rules: dict var->'nonpos'|'nonneg'
     """
+    beta_sim = beta_raw.copy()
     beta_new = beta_raw.copy()
-    const = float(beta_raw.get("const", 0.0))
+    # apply clips
+    for var, rule in rules.items():
+        if var in beta_sim.index:
+            if rule == "nonpos":
+                beta_new[var] = min(beta_sim[var], 0.0)
+            elif rule == "nonneg":
+                beta_new[var] = max(beta_sim[var], 0.0)
+    # recenter constant: const_new = const_raw + sum((b_raw - b_new)*E[x])
+    const = beta_sim.get("const", 0.0)
     shift = 0.0
     for var, rule in rules.items():
-        if var in beta_raw.index:
-            old = float(beta_raw[var])
-            if rule == "nonpos":
-                new = min(old, 0.0)
-            elif rule == "nonneg":
-                new = max(old, 0.0)
-            else:
-                new = old
-            beta_new[var] = new
-            shift += (old - new) * float(means.get(var, 0.0))
+        if var in beta_sim.index:
+            shift += (beta_sim[var] - beta_new[var]) * float(means.get(var, 0.0))
     beta_new["const"] = const + shift
     return beta_new
 
-def fit_models_original(
-    df_est: pd.DataFrame,
-    pi_star_quarterly: float,
-    is_selected: List[str],
-    pc_selected: List[str],
-    tr_selected: List[str],
-    mon_pass_floor_pp: float,  # NEW: minimum Δg (pp) from −100bp easing
-):
+def fit_models_original(df_est: pd.DataFrame, pi_star_quarterly: float,
+                        is_selected: List[str], pc_selected: List[str], tr_selected: List[str]):
     """Fit OLS for IS, Phillips, and Taylor. Clip signs for simulation and keep raw OLS for display."""
     # ---------- IS ----------
     if not is_selected:
@@ -352,18 +335,6 @@ def fit_models_original(
         model_is.params, X_is_means,
         rules={"Real_Rate_L2_data": "nonpos"}
     )
-
-    # Enforce monetary transmission floor (convert pp per −100bp to decimal/decimal)
-    # Example: 0.05 pp  →  0.0005 growth for Δrr = −0.01  →  |beta| floor = 0.0005 / 0.01 = 0.05
-    beta_floor_abs = (mon_pass_floor_pp / 100.0) / 0.01  # decimal growth per 1.00% (=100bp) rr change
-    if "Real_Rate_L2_data" in beta_is_sim.index:
-        current = float(beta_is_sim["Real_Rate_L2_data"])
-        desired = -max(abs(current), beta_floor_abs)  # keep ≤ 0 and at least the floor in magnitude
-        if desired != current:
-            # recenter constant to preserve the unconditional mean
-            mean_rr = float(X_is_means.get("Real_Rate_L2_data", 0.0))
-            beta_is_sim["const"] = float(beta_is_sim.get("const", 0.0)) + (current - desired) * mean_rr
-            beta_is_sim["Real_Rate_L2_data"] = desired
 
     # ---------- Phillips ----------
     if not pc_selected:
@@ -423,7 +394,7 @@ def fit_models_original(
     }
 
 def build_shocks_original(T, target, is_size_pp, pc_size_pp, policy_bp_abs, t0, rho):
-    """Normalize/strip target to avoid string mismatches (Option C)."""
+    """Normalize/strip target to avoid string mismatches."""
     is_arr = np.zeros(T); pc_arr = np.zeros(T); pol_arr = np.zeros(T)
     target_norm = (target or "None").strip().lower()
 
@@ -470,7 +441,7 @@ def simulate_original(
     for t in range(1, T):
         rr_lag2 = (i[t - 2] - p[t - 2]) if t >= 2 else real_rate_mean_dec
 
-        # IS (use theory-consistent beta with floor)
+        # IS (use theory-consistent beta)
         vals_is = {
             "DlogGDP_L1": g[t - 1],
             "Real_Rate_L2_data": rr_lag2,
@@ -490,7 +461,7 @@ def simulate_original(
             "Dlog_Energy_L1": means["Dlog_Energy_L1"],
             "Dlog_Non_Energy_L1": means["Dlog_Non_Energy_L1"],
         }
-        Xpc = row_from_params(model_pc.params.index, vals_pc)
+        Xpc = row_from_params(models["model_pc"].params.index, vals_pc)
         p[t] = predict_with_params(Xpc, beta_pc_sim) + pc_shock_arr[t]
 
         # Taylor target (deviation form + neutral anchor)
@@ -530,8 +501,8 @@ try:
             pi_star_quarterly = (annual_pct / 100.0) / 4.0
             st.info(f"π* set to {annual_pct:.2f}% annual ⇒ {pi_star_quarterly:.4f} quarterly (decimal)")
 
-        # Fit with selected regressors (include pass-through floor)
-        models_o = fit_models_original(df_est, pi_star_quarterly, is_selected, pc_selected, tr_selected, mon_pass_floor_pp)
+        # Fit with selected regressors
+        models_o = fit_models_original(df_est, pi_star_quarterly, is_selected, pc_selected, tr_selected)
 
         # Anchors & means
         i_mean_dec = float(df_est["Nominal Rate"].mean())
@@ -651,7 +622,7 @@ try:
         if not np.isnan(phi_g_star): parts.append(rf"\phi_{{g}}^\* = {phi_g_star:.3f}")
 
         st.latex(r"i_t^\* \;=\; \alpha^\*_{\text{sim}} \;+\; \phi_{\pi}^\*\,(\pi_t - \pi^\*) \;+\; \phi_{g}^\*\,\big(g_t - \bar g\big)")
-        st.caption("Simulation uses clipped signs: IS real-rate ≤ 0 (with a floor), Phillips activity ≥ 0, Taylor φ’s ≥ 0; α* is set so the long run equals the neutral rate.")
+        st.caption("Simulation uses clipped signs: IS real-rate ≤ 0, Phillips activity ≥ 0, Taylor φ’s ≥ 0; α* is set so the long run equals the neutral rate.")
 
     else:
         # =========================
@@ -708,5 +679,5 @@ try:
             st.latex(r"i_t = \rho_i i_{t-1} \;+\; (1-\rho_i)(\phi_\pi \pi_t + \phi_x x_t) \;+\; \varepsilon^i_t")
 
 except Exception as e:
-    st.error(f"Problem loading or running the selected model: {e}")
-    st.stop()
+    st.error(f"
+
