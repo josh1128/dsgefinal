@@ -2,11 +2,11 @@
 # -----------------------------------------------------------
 # Streamlit app that runs:
 #   1) Original model (DSGE.xlsx): IS (DlogGDP), Phillips (Dlog_CPI), Taylor (Nominal rate)
-#      - Sidebar toggles to include/exclude regressors in each curve
 #      - Taylor uses inflation gap (π_t − π*)
 #      - Shocks: IS, Phillips, and Taylor (tightening/easing)
 #      - Policy shock behavior selector
 #      - LaTeX equations shown below charts
+#      - NEW: Monetary transmission floor so policy shocks move GDP/inflation
 #   2) Simple NK (built-in)
 # -----------------------------------------------------------
 
@@ -39,30 +39,18 @@ def ensure_decimal_rate(series: pd.Series) -> pd.Series:
     return s/100.0 if np.nanmedian(np.abs(s.values)) > 1.0 else s
 
 def fmt_coef(x: float, nd: int = 3) -> str:
-    s = f"{x:.{nd}f}"
-    return f"+{s}" if x >= 0 else s
+    s = f"{x:.{nd}f}"; return f"+{s}" if x >= 0 else s
 
 def build_latex_equation(const_val: float, terms: List[tuple], lhs: str, eps_symbol: str) -> str:
-    if not terms:
-        rhs_terms = ""
-    else:
-        rhs_terms = " ".join([f"{fmt_coef(c)}\\,{sym}" for (c, sym) in terms])
-    eq = rf"""
-    \begin{{aligned}}
-    {lhs} &= {const_val:.3f} {rhs_terms} + {eps_symbol}
-    \end{{aligned}}
-    """
-    return eq
+    rhs_terms = "" if not terms else " ".join([f"{fmt_coef(c)}\\,{sym}" for (c, sym) in terms])
+    return rf"""\begin{{aligned}} {lhs} &= {const_val:.3f} {rhs_terms} + {eps_symbol} \end{{aligned}}"""
 
 def row_from_params(params_index: pd.Index, values: Dict[str, float]) -> pd.DataFrame:
     cols = list(params_index)
-    row = {}
-    for c in cols:
-        row[c] = 1.0 if c == "const" else float(values.get(c, 0.0))
+    row = {c: (1.0 if c == "const" else float(values.get(c, 0.0))) for c in cols}
     return pd.DataFrame([row], columns=cols)
 
 def predict_with_params(row_df: pd.DataFrame, beta: pd.Series) -> float:
-    # row_df: single row with cols aligned to beta.index
     x = row_df[beta.index].iloc[0].values.astype(float)
     b = beta.values.astype(float)
     return float(np.dot(x, b))
@@ -212,6 +200,14 @@ with st.sidebar:
         with st.expander("Taylor Rule regressors", expanded=True):
             tr_selected = st.multiselect("Use these variables in the Taylor (partial adjustment) regression:", TR_ALL, default=TR_ALL, key="tr_vars")
 
+        st.divider()
+        # ---- Monetary transmission floor (NEW) ----
+        mon_pass_floor_pp = st.slider(
+            "Min Δg from −100 bp (pp)",
+            0.00, 0.50, 0.05, 0.01,
+            help="Floor on policy→activity pass-through: a 100 bp rate cut must raise quarterly GDP growth by at least this many **percentage points** (shows in t+2 because IS uses RR_{t-2})."
+        )
+
     else:
         st.info("**Mapping:** IS→(σ, ρx, ρr) • Phillips→(κ, γπ, ρu) • Taylor→(φπ, φx, ρi)")
         st.header("Simple NK parameters (pp units)")
@@ -273,7 +269,6 @@ def load_and_prepare_original(file_like_or_path) -> Tuple[pd.DataFrame, pd.DataF
     )
 
     df["Nominal Rate"] = ensure_decimal_rate(df["Nominal Rate"])
-
     df["DlogGDP_L1"] = df["DlogGDP"].shift(1)
     df["Dlog_CPI_L1"] = df["Dlog_CPI"].shift(1)
     df["Nominal_Rate_L1"] = df["Nominal Rate"].shift(1)
@@ -286,40 +281,32 @@ def load_and_prepare_original(file_like_or_path) -> Tuple[pd.DataFrame, pd.DataF
         "Dlog_Reer_L2", "Dlog_Energy_L1", "Dlog_Non_Energy_L1",
     ]
     missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        raise KeyError(f"Missing required columns: {missing}")
+    if missing: raise KeyError(f"Missing required columns: {missing}")
 
     df_est = df.dropna(subset=required_cols).copy()
-    if df_est.empty:
-        raise ValueError("No rows remain after dropping NA for required columns. Check your data.")
+    if df_est.empty: raise ValueError("No rows remain after dropping NA for required columns. Check your data.")
     return df, df_est
 
 def _clip_and_recentre(beta_raw: pd.Series, means: Dict[str, float], rules: Dict[str, str]) -> pd.Series:
-    """
-    Clip selected coefficients per rules and adjust constant so that E[y] is preserved.
-    rules: dict var->'nonpos'|'nonneg'
-    """
-    beta_sim = beta_raw.copy()
+    """Clip selected coefficients per rules and adjust constant so that E[y] is preserved."""
     beta_new = beta_raw.copy()
-    # apply clips
     for var, rule in rules.items():
-        if var in beta_sim.index:
-            if rule == "nonpos":
-                beta_new[var] = min(beta_sim[var], 0.0)
-            elif rule == "nonneg":
-                beta_new[var] = max(beta_sim[var], 0.0)
+        if var in beta_new.index:
+            if rule == "nonpos": beta_new[var] = min(float(beta_new[var]), 0.0)
+            elif rule == "nonneg": beta_new[var] = max(float(beta_new[var]), 0.0)
     # recenter constant: const_new = const_raw + sum((b_raw - b_new)*E[x])
-    const = beta_sim.get("const", 0.0)
+    const = float(beta_raw.get("const", 0.0))
     shift = 0.0
     for var, rule in rules.items():
-        if var in beta_sim.index:
-            shift += (beta_sim[var] - beta_new[var]) * float(means.get(var, 0.0))
+        if var in beta_raw.index:
+            shift += (float(beta_raw[var]) - float(beta_new[var])) * float(means.get(var, 0.0))
     beta_new["const"] = const + shift
     return beta_new
 
 def fit_models_original(df_est: pd.DataFrame, pi_star_quarterly: float,
-                        is_selected: List[str], pc_selected: List[str], tr_selected: List[str]):
-    """Fit OLS for IS, Phillips, and Taylor. Clip signs for simulation and keep raw OLS for display."""
+                        is_selected: List[str], pc_selected: List[str], tr_selected: List[str],
+                        mon_pass_floor_pp: float):
+    """Fit OLS for IS, Phillips, and Taylor; enforce sign clips; add a floor on RR pass-through."""
     # ---------- IS ----------
     if not is_selected:
         raise ValueError("Select at least one regressor for IS (besides constant).")
@@ -327,14 +314,19 @@ def fit_models_original(df_est: pd.DataFrame, pi_star_quarterly: float,
     y_is = df_est["DlogGDP"]
     model_is = sm.OLS(y_is, X_is).fit()
 
-    # means of regressors used for recentering
     X_is_means = {c: float(X_is[c].mean()) for c in X_is.columns if c != "const"}
+    beta_is_sim = _clip_and_recentre(model_is.params, X_is_means, rules={"Real_Rate_L2_data": "nonpos"})
 
-    # Clip RR effect to be ≤ 0 (theory) for simulation
-    beta_is_sim = _clip_and_recentre(
-        model_is.params, X_is_means,
-        rules={"Real_Rate_L2_data": "nonpos"}
-    )
+    # ---- Monetary transmission floor: −100bp must raise g by at least mon_pass_floor_pp (pp) ----
+    # floor in decimal/decimal: (pp → decimal) / 0.01
+    floor_abs = (mon_pass_floor_pp / 100.0) / 0.01  # e.g., 0.05pp ⇒ 0.0005/0.01 = 0.05
+    if "Real_Rate_L2_data" in beta_is_sim.index:
+        current = float(beta_is_sim["Real_Rate_L2_data"])
+        desired = -max(abs(current), floor_abs)  # keep ≤ 0 and ≥ floor in magnitude
+        if desired != current:
+            mean_rr = float(X_is_means.get("Real_Rate_L2_data", 0.0))
+            beta_is_sim["const"] = float(beta_is_sim.get("const", 0.0)) + (current - desired) * mean_rr
+            beta_is_sim["Real_Rate_L2_data"] = desired
 
     # ---------- Phillips ----------
     if not pc_selected:
@@ -344,12 +336,7 @@ def fit_models_original(df_est: pd.DataFrame, pi_star_quarterly: float,
     model_pc = sm.OLS(y_pc, X_pc).fit()
 
     X_pc_means = {c: float(X_pc[c].mean()) for c in X_pc.columns if c != "const"}
-
-    # Clip activity slope to be ≥ 0
-    beta_pc_sim = _clip_and_recentre(
-        model_pc.params, X_pc_means,
-        rules={"DlogGDP_L1": "nonneg"}
-    )
+    beta_pc_sim = _clip_and_recentre(model_pc.params, X_pc_means, rules={"DlogGDP_L1": "nonneg"})
 
     # ---------- Taylor (with inflation gap) ----------
     infl_gap_full = df_est["Dlog_CPI"] - pi_star_quarterly
@@ -364,8 +351,7 @@ def fit_models_original(df_est: pd.DataFrame, pi_star_quarterly: float,
     model_tr = sm.OLS(y_tr, X_tr).fit()
 
     b0 = float(model_tr.params.get("const", 0.0))
-    rhoh = float(model_tr.params.get("Nominal_Rate_L1", 0.0))
-    rhoh = min(max(rhoh, 0.0), 0.99)
+    rhoh = min(max(float(model_tr.params.get("Nominal_Rate_L1", 0.0)), 0.0), 0.99)
 
     def safe_div(num, den): return num / den if abs(den) > 1e-8 else np.nan
 
@@ -374,30 +360,25 @@ def fit_models_original(df_est: pd.DataFrame, pi_star_quarterly: float,
     bg  = float(model_tr.params.get("DlogGDP", 0.0))
     phi_pi_star_raw = safe_div(bpi, (1 - rhoh)) if "Inflation_Gap" in model_tr.params.index else np.nan
     phi_g_star_raw  = safe_div(bg,  (1 - rhoh)) if "DlogGDP"      in model_tr.params.index else np.nan
-
-    # Taylor: clip to theory for simulation
     phi_pi_star_sim = np.nan if np.isnan(phi_pi_star_raw) else max(0.0, phi_pi_star_raw)
     phi_g_star_sim  = np.nan if np.isnan(phi_g_star_raw)  else max(0.0,  phi_g_star_raw)
 
-    # Long-run sample means to anchor steady state
-    p_ss = float(df_est["Dlog_CPI"].mean())   # \bar{π}
-    g_ss = float(df_est["DlogGDP"].mean())    # \bar{g}
+    p_ss = float(df_est["Dlog_CPI"].mean())  # long-run averages for anchoring
+    g_ss = float(df_est["DlogGDP"].mean())
 
     return {
         "model_is": model_is, "model_pc": model_pc, "model_tr": model_tr,
-        "beta_is_sim": beta_is_sim, "beta_pc_sim": beta_pc_sim,  # simulation params for IS/PC
+        "beta_is_sim": beta_is_sim, "beta_pc_sim": beta_pc_sim,
         "alpha_star": alpha_star,
-        "phi_pi_star": phi_pi_star_raw, "phi_g_star": phi_g_star_raw,         # display
-        "phi_pi_star_sim": phi_pi_star_sim, "phi_g_star_sim": phi_g_star_sim, # simulation
+        "phi_pi_star": phi_pi_star_raw, "phi_g_star": phi_g_star_raw,
+        "phi_pi_star_sim": phi_pi_star_sim, "phi_g_star_sim": phi_g_star_sim,
         "rho_hat": rhoh, "pi_star_quarterly": float(pi_star_quarterly),
         "p_ss": p_ss, "g_ss": g_ss
     }
 
 def build_shocks_original(T, target, is_size_pp, pc_size_pp, policy_bp_abs, t0, rho):
-    """Normalize/strip target to avoid string mismatches."""
     is_arr = np.zeros(T); pc_arr = np.zeros(T); pol_arr = np.zeros(T)
     target_norm = (target or "None").strip().lower()
-
     if target_norm == "is (demand)".lower():
         is_arr[t0] = is_size_pp / 100.0
         for k in range(t0 + 1, T): is_arr[k] = rho * is_arr[k - 1]
@@ -435,13 +416,13 @@ def simulate_original(
     if pc_shock_arr is None: pc_shock_arr = np.zeros(T)
     if policy_shock_arr is None: policy_shock_arr = np.zeros(T)
 
-    # Taylor alpha*: anchor long-run to neutral
+    # Taylor α* so that long run equals the chosen neutral rate (in decimals)
     alpha_star_sim = neutral_dec - (0.0 if np.isnan(phi_pi_star_sim) else phi_pi_star_sim) * (p_ss - pi_star_quarterly)
 
     for t in range(1, T):
         rr_lag2 = (i[t - 2] - p[t - 2]) if t >= 2 else real_rate_mean_dec
 
-        # IS (use theory-consistent beta)
+        # IS (policy → real rate → growth) with two-quarter lag
         vals_is = {
             "DlogGDP_L1": g[t - 1],
             "Real_Rate_L2_data": rr_lag2,
@@ -453,7 +434,7 @@ def simulate_original(
         Xis = row_from_params(model_is.params.index, vals_is)
         g[t] = predict_with_params(Xis, beta_is_sim) + is_shock_arr[t]
 
-        # Phillips (use theory-consistent beta)
+        # Phillips (activity feeds inflation)
         vals_pc = {
             "Dlog_CPI_L1": p[t - 1],
             "DlogGDP_L1": g[t - 1],
@@ -461,10 +442,10 @@ def simulate_original(
             "Dlog_Energy_L1": means["Dlog_Energy_L1"],
             "Dlog_Non_Energy_L1": means["Dlog_Non_Energy_L1"],
         }
-        Xpc = row_from_params(models["model_pc"].params.index, vals_pc)
+        Xpc = row_from_params(model_pc.params.index, vals_pc)
         p[t] = predict_with_params(Xpc, beta_pc_sim) + pc_shock_arr[t]
 
-        # Taylor target (deviation form + neutral anchor)
+        # Taylor (partial adjustment) with policy shock
         pi_gap_t = p[t] - pi_star_quarterly
         g_dev_t  = g[t] - g_ss
         i_star = (alpha_star_sim
@@ -476,7 +457,7 @@ def simulate_original(
             i_raw = rho_sim * i[t - 1] + (1 - rho_sim) * i_star + eps
         elif policy_mode.startswith("Add to target"):
             i_raw = rho_sim * i[t - 1] + (1 - rho_sim) * (i_star + eps)
-        else:
+        else:  # local-jump override
             i_raw = rho_sim * i[t - 1] + (1 - rho_sim) * i_star + eps
             if eps > 0: i_raw = max(i_raw, i[t - 1] + abs(eps))
             elif eps < 0: i_raw = min(i_raw, i[t - 1] - abs(eps))
@@ -501,8 +482,13 @@ try:
             pi_star_quarterly = (annual_pct / 100.0) / 4.0
             st.info(f"π* set to {annual_pct:.2f}% annual ⇒ {pi_star_quarterly:.4f} quarterly (decimal)")
 
-        # Fit with selected regressors
-        models_o = fit_models_original(df_est, pi_star_quarterly, is_selected, pc_selected, tr_selected)
+        # Fit with selected regressors (with pass-through floor)
+        models_o = fit_models_original(df_est, pi_star_quarterly, is_selected, pc_selected, tr_selected, mon_pass_floor_pp)
+
+        # Warn if policy shock but Real_Rate_L2_data is excluded (kills transmission)
+        if isinstance(shock_target, str) and "taylor" in shock_target.lower() and "Real_Rate_L2_data" not in is_selected:
+            st.warning("Policy shock selected but **Real_Rate_L2_data** is not in the IS regressors — "
+                       "add it back to allow policy to affect GDP.")
 
         # Anchors & means
         i_mean_dec = float(df_est["Nominal Rate"].mean())
@@ -521,8 +507,8 @@ try:
         is_arr, pc_arr, pol_arr = build_shocks_original(
             T, shock_target, is_shock_size_pp, pc_shock_size_pp, policy_shock_bp_abs, shock_quarter, shock_persist
         )
-
         neutral_dec = neutral_rate_pct / 100.0
+
         g0, p0, i0 = simulate_original(
             T, rho_sim, df_est, models_o, means_o, i_mean_dec, real_rate_mean_dec, pi_star_quarterly,
             policy_mode=policy_mode, neutral_dec=neutral_dec
@@ -559,12 +545,11 @@ try:
 
         plt.tight_layout(); st.pyplot(fig)
 
-        # Readout & guardrail
+        # Readout
         if isinstance(shock_target, str) and "taylor" in shock_target.lower():
             delta_i_bp = (iS - i0)[shock_quarter] * 10000.0
             st.info(f"Δ policy rate at t={shock_quarter}: {delta_i_bp:.1f} bp  |  mode: {policy_mode}  |  ρ={rho_sim:.2f}")
-            if "tightening" in shock_target.lower() and delta_i_bp < 0:
-                st.warning("Tightening selected but Δi on impact is negative. Check inputs.")
+            st.caption("Policy affects GDP at t+2 (IS uses RR_{t-2}).")
 
         # ===== LaTeX equations (display raw OLS) =====
         st.subheader("Estimated Equations (Original model)")
@@ -622,7 +607,7 @@ try:
         if not np.isnan(phi_g_star): parts.append(rf"\phi_{{g}}^\* = {phi_g_star:.3f}")
 
         st.latex(r"i_t^\* \;=\; \alpha^\*_{\text{sim}} \;+\; \phi_{\pi}^\*\,(\pi_t - \pi^\*) \;+\; \phi_{g}^\*\,\big(g_t - \bar g\big)")
-        st.caption("Simulation uses clipped signs: IS real-rate ≤ 0, Phillips activity ≥ 0, Taylor φ’s ≥ 0; α* is set so the long run equals the neutral rate.")
+        st.caption("Simulation uses clipped signs: IS real-rate ≤ 0 (with a floor), Phillips activity ≥ 0, Taylor φ’s ≥ 0; α* is set so the long run equals the neutral rate.")
 
     else:
         # =========================
@@ -681,5 +666,6 @@ try:
 except Exception as e:
     st.error(f"Problem loading or running the selected model: {e}")
     st.stop()
+
 
 
