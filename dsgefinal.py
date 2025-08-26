@@ -2,7 +2,7 @@
 # -----------------------------------------------------------
 # Streamlit app that runs:
 #   1) Original model (DSGE.xlsx): IS (DlogGDP), Phillips (Dlog_CPI), Taylor (Nominal rate)
-#      - Real rate uses **lag 1** (i_{t-1} - π_{t-1})
+#      - Real rate uses lag 1: RR_{t-1} = i_{t-1} − π_{t-1}
 #      - Taylor uses inflation gap (π_t − π*)
 #      - Shocks: IS, Phillips, and Taylor (tightening/easing)
 #      - Policy shock behavior selector
@@ -27,9 +27,9 @@ st.set_page_config(page_title="DSGE IRF Dashboard", layout="wide")
 st.title("DSGE IRF Dashboard — IS, Phillips, Taylor")
 
 st.markdown(
-    "- **Original**: GDP & CPI in **%** (Dlog × 100); **Nominal rate** in **decimal**.\n"
-    "- **Taylor** uses **inflation gap**: \\(\\pi_t - \\pi^*\\).\n"
-    "- **Convention alignment**: for **policy shocks**, Original plots are **IRF deviations** like the NK panel (baseline = 0)."
+    "- **Units (Original model plots):** Real GDP growth **DlogGDP in %**, Inflation **DlogCPI in %**, "
+    "and the **Taylor policy rate in decimals**.\n"
+    "- **Taylor** uses the **inflation gap** \\((\\pi_t - \\pi^*)\\)."
 )
 
 # =========================
@@ -124,9 +124,9 @@ with st.sidebar:
     T = st.slider("Horizon (quarters)", 8, 60, 20, 1)
 
     neutral_rate_pct = st.number_input(
-        "Baseline (neutral) nominal policy rate — % annual",
+        "Neutral nominal policy rate — % annual",
         value=2.00, step=0.25, format="%.2f",
-        help="Long-run policy rate anchor."
+        help="Used for NK level plotting."
     )
 
     if model_choice == "Original (DSGE.xlsx)":
@@ -184,8 +184,6 @@ with st.sidebar:
             0.00, 0.50, 0.05, 0.01,
             help="Floor on policy→activity: a 100 bp rate cut must raise quarterly GDP growth by at least this many **percentage points** (shows mainly at t+1 because IS uses RR_{t-1})."
         )
-        # Optional manual toggle if user wants IRFs for non-policy shocks:
-        plot_style_override = st.checkbox("Force IRF-style (deviation) plotting for non-policy shocks", value=False)
 
     else:
         st.info("**Mapping:** IS→(σ, ρx, ρr) • Phillips→(κ, γπ, ρu) • Taylor→(φπ, φx, ρi)")
@@ -208,8 +206,8 @@ with st.sidebar:
         shock_size_pp_nk = st.number_input("Shock size (pp)", value=1.00, step=0.25, format="%.2f")
         shock_quarter_nk = st.slider("Shock timing t", 1, T-1, 1, 1)
         shock_persist_nk = st.slider("Shock persistence ρ_shock", 0.0, 0.98, 0.80, 0.02)
-        snapback = st.checkbox("Snap-back (no persistence after the shock)", value=True)
-        units_mode = st.radio("Policy rate units", ["Deviation (pp)", "Level (% annual)"], index=0)
+        # Plot the NK rate in **decimal** when showing level:
+        units_mode = st.radio("NK policy rate units", ["Deviation (pp)", "Level (decimal)"], index=1)
 
 # =========================
 # ORIGINAL MODEL (DSGE.xlsx)
@@ -237,7 +235,7 @@ def load_and_prepare_original(file_like_or_path) -> Tuple[pd.DataFrame, pd.DataF
     df["DlogGDP_L1"] = df["DlogGDP"].shift(1)
     df["Dlog_CPI_L1"] = df["Dlog_CPI"].shift(1)
     df["Nominal_Rate_L1"] = df["Nominal Rate"].shift(1)
-    # *** LAG CHANGE: RR lag 1 (not 2) ***
+    # ---- RR lag 1 (not lag 2) ----
     df["Real_Rate_L1_data"] = (df["Nominal Rate"] - df["Dlog_CPI"]).shift(1)
 
     required_cols = [
@@ -271,12 +269,15 @@ def fit_models_original(df_est: pd.DataFrame, pi_star_quarterly: float,
                         is_selected: List[str], pc_selected: List[str], tr_selected: List[str],
                         mon_pass_floor_pp: float):
     # ---------- IS ----------
+    if not is_selected:
+        raise ValueError("Select at least one regressor for IS (besides constant).")
     X_is = sm.add_constant(df_est[is_selected], has_constant="add")
     y_is = df_est["DlogGDP"]
     model_is = sm.OLS(y_is, X_is).fit()
     X_is_means = {c: float(X_is[c].mean()) for c in X_is.columns if c != "const"}
     beta_is_sim = _clip_and_recentre(model_is.params, X_is_means, rules={"Real_Rate_L1_data": "nonpos"})
-    # pass-through floor (100bp cut → ≥ mon_pass_floor_pp pp increase in growth)
+
+    # Pass-through floor: 100bp cut → ≥ mon_pass_floor_pp pp ↑ in growth
     floor_abs = (mon_pass_floor_pp / 100.0) / 0.01  # pp→decimal / 0.01
     if "Real_Rate_L1_data" in beta_is_sim.index:
         current = float(beta_is_sim["Real_Rate_L1_data"])
@@ -287,6 +288,8 @@ def fit_models_original(df_est: pd.DataFrame, pi_star_quarterly: float,
             beta_is_sim["Real_Rate_L1_data"] = desired
 
     # ---------- Phillips ----------
+    if not pc_selected:
+        raise ValueError("Select at least one regressor for Phillips (besides constant).")
     X_pc = sm.add_constant(df_est[pc_selected], has_constant="add")
     y_pc = df_est["Dlog_CPI"]
     model_pc = sm.OLS(y_pc, X_pc).fit()
@@ -299,6 +302,8 @@ def fit_models_original(df_est: pd.DataFrame, pi_star_quarterly: float,
     if "Nominal_Rate_L1" in tr_selected: df_tr["Nominal_Rate_L1"] = df_est["Nominal_Rate_L1"]
     if "Inflation_Gap" in tr_selected:   df_tr["Inflation_Gap"]   = infl_gap_full
     if "DlogGDP" in tr_selected:         df_tr["DlogGDP"]         = df_est["DlogGDP"]
+    if df_tr.empty: raise ValueError("Select at least one regressor for Taylor (besides constant).")
+
     X_tr = sm.add_constant(df_tr, has_constant="add")
     y_tr = df_est["Nominal Rate"]
     model_tr = sm.OLS(y_tr, X_tr).fit()
@@ -322,7 +327,8 @@ def fit_models_original(df_est: pd.DataFrame, pi_star_quarterly: float,
         "beta_is_sim": beta_is_sim, "beta_pc_sim": beta_pc_sim,
         "alpha_star": alpha_star, "rho_hat": rhoh,
         "phi_pi_star_sim": phi_pi_star_sim, "phi_g_star_sim": phi_g_star_sim,
-        "pi_star_quarterly": float(pi_star_quarterly), "p_ss": p_ss, "g_ss": g_ss
+        "pi_star_quarterly": float(pi_star_quarterly),
+        "p_ss": p_ss, "g_ss": g_ss
     }
 
 def build_shocks_original(T, target, is_size_pp, pc_size_pp, policy_bp_abs, t0, rho):
@@ -349,6 +355,8 @@ def simulate_original(
     pi_star_quarterly: float, is_shock_arr=None, pc_shock_arr=None, policy_shock_arr=None,
     policy_mode: str = "Add after smoothing (standard)", neutral_dec: float = 0.02
 ):
+    """Forward-simulate GDP growth (g), inflation (p), and the nominal rate (i).
+       Units: g & p in decimals internally; i in decimals."""
     g = np.zeros(T); p = np.zeros(T); i = np.zeros(T)
     g[0] = float(df_est["DlogGDP"].mean())
     p[0] = float(df_est["Dlog_CPI"].mean())
@@ -364,12 +372,14 @@ def simulate_original(
     if pc_shock_arr is None: pc_shock_arr = np.zeros(T)
     if policy_shock_arr is None: policy_shock_arr = np.zeros(T)
 
+    # Intercept so long-run equals chosen neutral rate
     alpha_star_sim = neutral_dec - (0.0 if np.isnan(phi_pi_star_sim) else phi_pi_star_sim) * (p_ss - pi_star_quarterly)
 
     for t in range(1, T):
-        # *** RR lag 1 ***
+        # Real rate with 1-quarter lag (decimal)
         rr_lag1 = (i[t - 1] - p[t - 1]) if t >= 1 else real_rate_mean_dec
 
+        # IS (g_t)
         vals_is = {
             "DlogGDP_L1": g[t - 1],
             "Real_Rate_L1_data": rr_lag1,
@@ -381,6 +391,7 @@ def simulate_original(
         Xis = row_from_params(model_is.params.index, vals_is)
         g[t] = predict_with_params(Xis, beta_is_sim) + is_shock_arr[t]
 
+        # Phillips (p_t)
         vals_pc = {
             "Dlog_CPI_L1": p[t - 1],
             "DlogGDP_L1": g[t - 1],
@@ -391,18 +402,19 @@ def simulate_original(
         Xpc = row_from_params(model_pc.params.index, vals_pc)
         p[t] = predict_with_params(Xpc, beta_pc_sim) + pc_shock_arr[t]
 
+        # Taylor target and partial adjustment (i_t)
         pi_gap_t = p[t] - pi_star_quarterly
         g_dev_t  = g[t] - g_ss
         i_star = (alpha_star_sim
                   + (0.0 if np.isnan(phi_pi_star_sim) else phi_pi_star_sim) * pi_gap_t
                   + (0.0 if np.isnan(phi_g_star_sim)  else phi_g_star_sim)  * g_dev_t)
 
-        eps = policy_shock_arr[t]
+        eps = policy_shock_arr[t]  # decimal (e.g., 0.01 = 100 bp)
         if policy_mode.startswith("Add after"):
             i_raw = rho_sim * i[t - 1] + (1 - rho_sim) * i_star + eps
         elif policy_mode.startswith("Add to target"):
             i_raw = rho_sim * i[t - 1] + (1 - rho_sim) * (i_star + eps)
-        else:
+        else:  # local-jump override (guard a minimum jump)
             i_raw = rho_sim * i[t - 1] + (1 - rho_sim) * i_star + eps
             if eps > 0: i_raw = max(i_raw, i[t - 1] + abs(eps))
             elif eps < 0: i_raw = min(i_raw, i[t - 1] - abs(eps))
@@ -429,6 +441,11 @@ try:
 
         # Fit with selected regressors (with pass-through floor)
         models_o = fit_models_original(df_est, pi_star_quarterly, is_selected, pc_selected, tr_selected, mon_pass_floor_pp)
+
+        # Warn if policy shock but Real_Rate_L1_data is excluded (kills transmission)
+        if isinstance(shock_target, str) and "taylor" in shock_target.lower() and "Real_Rate_L1_data" not in is_selected:
+            st.warning("Policy shock selected but **Real_Rate_L1_data** is not in the IS regressors — "
+                       "add it back to allow policy to affect GDP.")
 
         # Anchors & means
         i_mean_dec = float(df_est["Nominal Rate"].mean())
@@ -459,66 +476,43 @@ try:
             policy_mode=policy_mode, neutral_dec=neutral_dec
         )
 
-        # ========= Plotting: match NK convention for policy shocks =========
-        is_policy = isinstance(shock_target, str) and "taylor" in shock_target.lower()
-        use_irf_style = is_policy or ('plot_style_override' in locals() and plot_style_override)
-
+        # ===== Plot (LEVELS): g & p in %, i in decimal =====
         plt.rcParams.update({"axes.titlesize": 16, "axes.labelsize": 12, "legend.fontsize": 11})
         fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
         quarters = np.arange(T); vline_kwargs = dict(color="black", linestyle=":", linewidth=1)
 
-        if use_irf_style:
-            # IRF deviations: baseline = 0 (match NK)
-            g0_plot = np.zeros_like(g0);        gS_plot = (gS - g0) * 100.0      # pp
-            p0_plot = np.zeros_like(p0);        pS_plot = (pS - p0) * 100.0      # pp
-            i0_plot = np.zeros_like(i0);        iS_plot = (iS - i0) * 10000.0    # bp
-            g_title = "Real GDP Growth (ΔlogGDP, pp — deviation)"
-            p_title = "Inflation (ΔlogCPI, pp — deviation)"
-            i_title = "Nominal Policy Rate (bp — deviation)"
-            ylab_gp = "pp"; i_ylabel = "bp"
-        else:
-            # Levels (no-shock vs shock)
-            g0_plot = g0 * 100.0;               gS_plot = gS * 100.0
-            p0_plot = p0 * 100.0;               pS_plot = pS * 100.0
-            i0_plot = i0;                       iS_plot = iS
-            g_title = "Real GDP Growth (ΔlogGDP, %)"
-            p_title = "Inflation (ΔlogCPI, %)"
-            i_title = "Nominal Policy Rate (decimal)"
-            ylab_gp = "%";  i_ylabel = "decimal"
-
-        axes[0].plot(quarters, g0_plot, label="Baseline", linewidth=2)
-        axes[0].plot(quarters, gS_plot, label="Shock", linewidth=2)
+        axes[0].plot(quarters, g0*100, label="Baseline", linewidth=2)
+        axes[0].plot(quarters, gS*100, label="Shock", linewidth=2)
         axes[0].axvline(shock_quarter, **vline_kwargs)
-        axes[0].set_title(g_title); axes[0].set_ylabel(ylab_gp)
+        axes[0].set_title("Real GDP Growth (DlogGDP, %)"); axes[0].set_ylabel("%")
         axes[0].grid(True, alpha=0.3); axes[0].legend(loc="best")
 
-        axes[1].plot(quarters, p0_plot, label="Baseline", linewidth=2)
-        axes[1].plot(quarters, pS_plot, label="Shock", linewidth=2)
+        axes[1].plot(quarters, p0*100, label="Baseline", linewidth=2)
+        axes[1].plot(quarters, pS*100, label="Shock", linewidth=2)
         axes[1].axvline(shock_quarter, **vline_kwargs)
-        axes[1].set_title(p_title); axes[1].set_ylabel(ylab_gp)
+        axes[1].set_title("Inflation (DlogCPI, %)"); axes[1].set_ylabel("%")
         axes[1].grid(True, alpha=0.3); axes[1].legend(loc="best")
 
-        axes[2].plot(quarters, i0_plot, label="Baseline", linewidth=2)
-        axes[2].plot(quarters, iS_plot, label="Shock", linewidth=2)
+        axes[2].plot(quarters, i0, label="Baseline", linewidth=2)
+        axes[2].plot(quarters, iS, label="Shock", linewidth=2)
         axes[2].axvline(shock_quarter, **vline_kwargs)
-        axes[2].set_title(i_title)
-        axes[2].set_xlabel("Quarters ahead"); axes[2].set_ylabel(i_ylabel)
+        axes[2].set_title("Nominal Policy Rate (decimal)")
+        axes[2].set_xlabel("Quarters ahead"); axes[2].set_ylabel("decimal")
         axes[2].grid(True, alpha=0.3); axes[2].legend(loc="best")
 
         plt.tight_layout(); st.pyplot(fig)
 
         # Readout
-        if is_policy:
+        if isinstance(shock_target, str) and "taylor" in shock_target.lower():
             delta_i_bp = (iS - i0)[shock_quarter] * 10000.0
-            st.info(f"Policy shock at t={shock_quarter}: Δi = {delta_i_bp:.1f} bp | mode: {policy_mode} | ρ={rho_sim:.2f}")
-            st.caption("With RR lag = 1, policy mainly affects GDP at **t+1** (previously t+2 with RR lag = 2).")
+            st.info(f"Δ policy rate at t={shock_quarter}: {delta_i_bp:.1f} bp  |  mode: {policy_mode}  |  ρ={rho_sim:.2f}")
+            st.caption("Policy affects GDP at **t+1** (IS uses RR_{t-1}).")
 
         # ===== LaTeX equations (display raw OLS) =====
         st.subheader("Estimated Equations (Original model)")
-        m_is = models_o["model_is"]; m_pc = models_o["model_pc"]
+        m_is = models_o["model_is"]; m_pc = models_o["model_pc"]; m_tr = models_o["model_tr"]
         alpha_star = models_o["alpha_star"]; rho_hat = models_o["rho_hat"]
         phi_pi_star = models_o["phi_pi_star_sim"]; phi_g_star = models_o["phi_g_star_sim"]
-        neutral_dec = neutral_rate_pct / 100.0
 
         # IS
         is_terms = []
@@ -569,25 +563,30 @@ try:
         # =========================
         P = NKParamsSimple(
             sigma=sigma, kappa=kappa, phi_pi=phi_pi, phi_x=phi_x, rho_i=rho_i,
-            rho_x=(0.0 if snapback else rho_x), rho_r=rho_r, rho_u=rho_u,
-            gamma_pi=(0.0 if snapback else gamma_pi)
+            rho_x=rho_x, rho_r=rho_r, rho_u=rho_u, gamma_pi=gamma_pi
         )
         model = SimpleNK3EqBuiltIn(P)
         label_to_code = {"Demand (IS)": "demand", "Cost-push (Phillips)": "cost", "Policy (Taylor)": "policy"}
         code = label_to_code[shock_type_nk]
         t0 = max(0, min(T-1, shock_quarter_nk - 1))
-        rho_for_shock = 0.0 if snapback else shock_persist_nk
+        rho_for_shock = shock_persist_nk
 
-        st.subheader("Impulse responses (IRF mode)")
-        h, x0,  pi0,  i0 = model.irf(code, T, 0.0,                t0, rho_for_shock)
-        h, xS,  piS,  iS = model.irf(code, T, shock_size_pp_nk,   t0, rho_for_shock)
+        st.subheader("Impulse responses")
+        h, x0, pi0, i0 = model.irf(code, T, 0.0, t0, rho_for_shock)
+        h, xS, piS, iS = model.irf(code, T, shock_size_pp_nk, t0, rho_for_shock)
 
-        i0_plot, iS_plot = i0.copy(), iS.copy()
-        i_ylabel = "pp"
-        if units_mode == "Level (% annual)":
-            i0_plot = neutral_rate_pct + i0_plot
-            iS_plot = neutral_rate_pct + iS_plot
-            i_ylabel = "%"
+        # Plot: keep x, π in pp; show rate in **decimal** when in level mode
+        neutral_dec = neutral_rate_pct / 100.0
+        if units_mode == "Level (decimal)":
+            i0_plot = neutral_dec + (i0 / 100.0)     # convert pp to decimal
+            iS_plot = neutral_dec + (iS / 100.0)
+            i_ylabel = "decimal"
+            i_title = "Nominal Policy Rate (level, decimal)"
+        else:
+            i0_plot = i0
+            iS_plot = iS
+            i_ylabel = "pp"
+            i_title = "Nominal Policy Rate (deviation, pp)"
 
         plt.rcParams.update({"axes.titlesize": 16, "axes.labelsize": 12, "legend.fontsize": 11})
         fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
@@ -606,7 +605,7 @@ try:
         axes[2].plot(h, i0_plot, linewidth=2, label="Baseline")
         axes[2].plot(h, iS_plot, linewidth=2, label="Shock")
         axes[2].axvline(t0, **vline_kwargs)
-        axes[2].set_title("Nominal Policy Rate (i_t)")
+        axes[2].set_title(i_title)
         axes[2].set_xlabel("Quarters ahead"); axes[2].set_ylabel(i_ylabel)
         axes[2].grid(True, alpha=0.3); axes[2].legend(loc="best")
 
