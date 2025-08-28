@@ -24,8 +24,7 @@ from pathlib import Path
 import os
 
 # ===== Desktop export folder =====
-file_path = r'C:\Users\AC03537\OneDrive - Alberta Central\Desktop'
-
+file_path = r'C:\Users\AC03537\Desktop'
 # =========================
 # Page setup
 # =========================
