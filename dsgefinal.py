@@ -9,22 +9,31 @@
 #      - LaTeX equations shown below charts
 #      - Monetary transmission floor on IS real-rate coefficient (optional)
 #      - (NEW) Neutral rate slider used for Original long-run target & NK level plotting
-#      - (NEW) Export plotted data to Excel on desktop
+#      - (NEW) Download results directly in the browser (Excel; CSV fallback)
 #   2) Simple NK (built-in)
 # -----------------------------------------------------------
 
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, List
+import io
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 import streamlit as st
 import matplotlib.pyplot as plt
 from pathlib import Path
-import os
 
-# ===== Desktop export folder =====
-file_path = r'C:\Users\AC03537\Desktop'
+# ===== Excel engine fallback (Excel preferred; CSV fallback if none) =====
+try:
+    import xlsxwriter  # noqa: F401
+    EXCEL_ENGINE = "xlsxwriter"
+except ModuleNotFoundError:
+    try:
+        import openpyxl  # noqa: F401
+        EXCEL_ENGINE = "openpyxl"
+    except ModuleNotFoundError:
+        EXCEL_ENGINE = None
+
 # =========================
 # Page setup
 # =========================
@@ -60,6 +69,19 @@ def predict_with_params(row_df: pd.DataFrame, beta: pd.Series) -> float:
     x = row_df[beta.index].iloc[0].values.astype(float)
     b = beta.values.astype(float)
     return float(np.dot(x, b))
+
+def make_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> Optional[bytes]:
+    """Return Excel bytes with multiple sheets if engine available; else None."""
+    if EXCEL_ENGINE is None:
+        return None
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine=EXCEL_ENGINE) as writer:
+        for name, df in sheets.items():
+            # Excel sheet names limited to 31 chars
+            safe_name = (name or "Sheet")[:31]
+            df.to_excel(writer, sheet_name=safe_name, index=False)
+    buf.seek(0)
+    return buf.getvalue()
 
 # =========================
 # Simple NK (built-in)
@@ -198,8 +220,7 @@ with st.sidebar:
         )
 
         st.divider()
-        st.header("Export")
-        export_filename = st.text_input("Excel filename (saved to Desktop)", value="dsge_export.xlsx")
+        export_filename = st.text_input("Download filename", value="dsge_export.xlsx")
 
     else:
         st.info("**Mapping:** IS→(σ, ρx, ρr) • Phillips→(κ, γπ, ρu) • Taylor→(φπ, φx, ρi)")
@@ -224,7 +245,7 @@ with st.sidebar:
         shock_persist_nk = st.slider("Shock persistence ρ_shock", 0.0, 0.98, 0.80, 0.02)
         units_mode = st.radio("NK policy rate units", ["Deviation (pp)", "Level (decimal)"], index=1)
         st.divider()
-        export_filename = st.text_input("Excel filename (saved to Desktop)", value="nk_export.xlsx")
+        export_filename = st.text_input("Download filename", value="nk_export.xlsx")
 
 # =========================
 # ORIGINAL MODEL (DSGE.xlsx)
@@ -354,7 +375,7 @@ def build_shocks_original(
     rr_bp_abs: int, fd_pp: float, energy_pp: float, nonenergy_pp: float,
     t0: int, rho: float
 ):
-    """Return arrays for all shocks. Units: pp inputs are converted to decimals for model internals; bp to decimal."""
+    """Return arrays for all shocks. Units: pp inputs -> decimal; bp -> decimal."""
     is_arr = np.zeros(T); pc_arr = np.zeros(T); pol_arr = np.zeros(T)
     rr_arr = np.zeros(T); fd_arr = np.zeros(T); en_arr = np.zeros(T); nen_arr = np.zeros(T)
 
@@ -424,7 +445,7 @@ def simulate_original(
         rr_extra = rr_shock_arr[t - 1] if t >= 1 else 0.0
         rr_lag1 = (i[t - 1] - p[t - 1]) + rr_extra
 
-        # Build exogenous terms (means + shocks; respect lags where applicable)
+        # Exogenous terms (means + shocks; respect lags where applicable)
         fd_val   = means["Dlog FD_Lag1"] + (fd_shock_arr[t - 1] if t >= 1 else 0.0)     # enters as _Lag1
         enr_val  = means["Dlog_Energy"] + energy_shock_arr[t]                            # contemporaneous
         nren_val = means["Dlog_NonEnergy"] + nonenergy_shock_arr[t]                      # contemporaneous
@@ -518,7 +539,7 @@ try:
         }
 
         # Build shocks & simulate
-        t0 = shock_quarter  # same indexing as your plotting line
+        t0 = shock_quarter  # align with plotting index
         is_arr, pc_arr, pol_arr, rr_arr, fd_arr, en_arr, nen_arr = build_shocks_original(
             T, shock_target, is_shock_size_pp, pc_shock_size_pp, policy_shock_bp_abs,
             rr_shock_bp_abs, fd_shock_pp, energy_shock_pp, nonenergy_shock_pp,
@@ -694,7 +715,7 @@ try:
 
         plt.tight_layout(); st.pyplot(fig)
 
-        # Export for NK
+        # Prepare export
         export_df = pd.DataFrame({
             "quarter": h,
             "x_baseline_pp": x0, "x_shock_pp": xS,
@@ -715,17 +736,34 @@ except Exception as e:
     st.stop()
 
 # =========================
-# Export button
+# Download buttons (browser)
 # =========================
 if export_ready and export_df is not None and export_filename:
-    export_fullpath = os.path.join(file_path, export_filename)
-    if st.button("Export current chart data to Excel"):
-        try:
-            with pd.ExcelWriter(export_fullpath, engine="xlsxwriter") as writer:
-                export_df.to_excel(writer, sheet_name="series", index=False)
-                if shocks_df is not None:
-                    shocks_df.to_excel(writer, sheet_name="shocks", index=False)
-            st.success(f"Exported to: {export_fullpath}")
-        except Exception as ex:
-            st.error(f"Failed to export to Excel: {ex}")
+    st.subheader("Download results")
+
+    # Try to build Excel; if no engine, offer CSV fallback
+    excel_bytes = make_excel_bytes({"series": export_df, "shocks": shocks_df if shocks_df is not None else pd.DataFrame()})
+
+    if excel_bytes is not None:
+        st.download_button(
+            label="📥 Download Excel (series + shocks)",
+            data=excel_bytes,
+            file_name=export_filename if export_filename.lower().endswith(".xlsx") else (export_filename + ".xlsx"),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        st.warning("No Excel writer found (install `XlsxWriter` or `openpyxl`). Providing CSV downloads instead.")
+        st.download_button(
+            label="📥 Download series (CSV)",
+            data=export_df.to_csv(index=False).encode("utf-8"),
+            file_name=(Path(export_filename).stem + "_series.csv"),
+            mime="text/csv",
+        )
+        if shocks_df is not None:
+            st.download_button(
+                label="📥 Download shocks (CSV)",
+                data=shocks_df.to_csv(index=False).encode("utf-8"),
+                file_name=(Path(export_filename).stem + "_shocks.csv"),
+                mime="text/csv",
+            )
 
