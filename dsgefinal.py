@@ -4,12 +4,13 @@
 #   1) Original model (DSGE.xlsx): IS (DlogGDP), Phillips (Dlog_CPI), Taylor (Nominal rate)
 #      - Real rate uses lag 1: RR_{t-1} = i_{t-1} − π_{t-1}
 #      - Taylor uses inflation gap (π_t − π*)
-#      - Shocks: IS, Phillips, Taylor + (NEW) RR, Foreign Demand, Energy, Non-Energy
+#      - Shocks: IS, Phillips, Taylor + RR, Foreign Demand, Energy, Non-Energy
+#      - Sign restrictions enforced (IS & Phillips); Taylor principle enforced (φπ* ≥ 1)
 #      - Policy shock behavior selector
 #      - LaTeX equations shown below charts
 #      - Monetary transmission floor on IS real-rate coefficient (optional)
-#      - (NEW) Neutral rate slider used for Original long-run target & NK level plotting
-#      - (NEW) Download results directly in the browser (Excel; CSV fallback)
+#      - Neutral rate slider used for Original long-run target & NK level plotting
+#      - Download results directly in the browser (Excel; CSV fallback)
 #   2) Simple NK (built-in)
 # -----------------------------------------------------------
 
@@ -77,9 +78,8 @@ def make_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> Optional[bytes]:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine=EXCEL_ENGINE) as writer:
         for name, df in sheets.items():
-            # Excel sheet names limited to 31 chars
-            safe_name = (name or "Sheet")[:31]
-            df.to_excel(writer, sheet_name=safe_name, index=False)
+            safe = (name or "Sheet")[:31]
+            df.to_excel(writer, sheet_name=safe, index=False)
     buf.seek(0)
     return buf.getvalue()
 
@@ -189,7 +189,7 @@ with st.sidebar:
         fd_shock_pp     = st.number_input("Foreign demand shock (pp, enters Dlog FD_Lag1 with lag)", value=0.00, step=0.05, format="%.2f")
         energy_shock_pp = st.number_input("Energy shock (pp)", value=0.00, step=0.05, format="%.2f")
         nonenergy_shock_pp = st.number_input("Non-energy shock (pp)", value=0.00, step=0.05, format="%.2f")
-        st.caption("Note: RR shock affects GDP at t+1 since IS uses RR_{t-1}. FD shock also appears with a lag.")
+        st.caption("RR shock affects GDP at t+1 since IS uses RR_{t-1}. FD shock also appears with a lag.")
 
         st.header("Policy shock behavior")
         policy_mode = st.radio(
@@ -290,6 +290,7 @@ def load_and_prepare_original(file_like_or_path) -> Tuple[pd.DataFrame, pd.DataF
     return df, df_est
 
 def _clip_and_recentre(beta_raw: pd.Series, means: Dict[str, float], rules: Dict[str, str]) -> pd.Series:
+    """Clip signs, then recenter the constant so the mean prediction is preserved."""
     beta_new = beta_raw.copy()
     for var, rule in rules.items():
         if var in beta_new.index:
@@ -306,6 +307,10 @@ def _clip_and_recentre(beta_raw: pd.Series, means: Dict[str, float], rules: Dict
 def fit_models_original(df_est: pd.DataFrame, pi_star_quarterly: float,
                         is_selected: List[str], pc_selected: List[str], tr_selected: List[str],
                         mon_pass_floor_pp: float):
+    """Fit OLS, then ENFORCE: IS (RR≤0, Energy≤0, Non-energy≤0, FD≥0);
+       Phillips (GDP≥0, lagged Energy≥0, lagged Non-energy≥0);
+       Taylor principle φπ* ≥ 1 (if identifiable)."""
+
     # ---------- IS ----------
     if not is_selected:
         raise ValueError("Select at least one regressor for IS (besides constant).")
@@ -313,7 +318,12 @@ def fit_models_original(df_est: pd.DataFrame, pi_star_quarterly: float,
     y_is = df_est["DlogGDP"]
     model_is = sm.OLS(y_is, X_is).fit()
     X_is_means = {c: float(X_is[c].mean()) for c in X_is.columns if c != "const"}
-    beta_is_sim = _clip_and_recentre(model_is.params, X_is_means, rules={"Real_Rate_L1_data": "nonpos"})
+
+    rules_is = {"Real_Rate_L1_data": "nonpos"}
+    if "Dlog_Energy" in X_is.columns:    rules_is["Dlog_Energy"] = "nonpos"
+    if "Dlog_NonEnergy" in X_is.columns: rules_is["Dlog_NonEnergy"] = "nonpos"
+    if "Dlog FD_Lag1" in X_is.columns:   rules_is["Dlog FD_Lag1"] = "nonneg"
+    beta_is_sim = _clip_and_recentre(model_is.params, X_is_means, rules=rules_is)
 
     # Pass-through floor: 100bp cut → ≥ mon_pass_floor_pp pp ↑ in growth
     floor_abs = (mon_pass_floor_pp / 100.0) / 0.01  # pp→decimal / 0.01
@@ -332,7 +342,11 @@ def fit_models_original(df_est: pd.DataFrame, pi_star_quarterly: float,
     y_pc = df_est["Dlog_CPI"]
     model_pc = sm.OLS(y_pc, X_pc).fit()
     X_pc_means = {c: float(X_pc[c].mean()) for c in X_pc.columns if c != "const"}
-    beta_pc_sim = _clip_and_recentre(model_pc.params, X_pc_means, rules={"DlogGDP_L1": "nonneg"})
+
+    rules_pc = {"DlogGDP_L1": "nonneg"}
+    if "Dlog_Energy_L1" in X_pc.columns:        rules_pc["Dlog_Energy_L1"] = "nonneg"
+    if "Dlog_Non_Energy_L1" in X_pc.columns:    rules_pc["Dlog_Non_Energy_L1"] = "nonneg"
+    beta_pc_sim = _clip_and_recentre(model_pc.params, X_pc_means, rules=rules_pc)
 
     # ---------- Taylor (partial adjustment with inflation gap) ----------
     infl_gap_full = df_est["Dlog_CPI"] - pi_star_quarterly
@@ -354,7 +368,9 @@ def fit_models_original(df_est: pd.DataFrame, pi_star_quarterly: float,
     bg  = float(model_tr.params.get("DlogGDP", 0.0))
     phi_pi_star_raw = safe_div(bpi, (1 - rhoh)) if "Inflation_Gap" in model_tr.params.index else np.nan
     phi_g_star_raw  = safe_div(bg,  (1 - rhoh)) if "DlogGDP"      in model_tr.params.index else np.nan
-    phi_pi_star_sim = np.nan if np.isnan(phi_pi_star_raw) else max(0.0, phi_pi_star_raw)
+
+    # Enforce non-negativity and Taylor principle
+    phi_pi_star_sim = np.nan if np.isnan(phi_pi_star_raw) else max(1.0, phi_pi_star_raw)   # φπ* ≥ 1
     phi_g_star_sim  = np.nan if np.isnan(phi_g_star_raw)  else max(0.0,  phi_g_star_raw)
 
     p_ss = float(df_est["Dlog_CPI"].mean())
@@ -391,14 +407,10 @@ def build_shocks_original(
         pol_arr[t0] = -(policy_bp_abs / 10000.0)
 
     # Additional shocks
-    if rr_bp_abs != 0:
-        rr_arr[t0] = rr_bp_abs / 10000.0  # decimal
-    if fd_pp != 0.0:
-        fd_arr[t0] = fd_pp / 100.0        # decimal
-    if energy_pp != 0.0:
-        en_arr[t0] = energy_pp / 100.0    # decimal
-    if nonenergy_pp != 0.0:
-        nen_arr[t0] = nonenergy_pp / 100.0
+    if rr_bp_abs != 0:        rr_arr[t0] = rr_bp_abs / 10000.0
+    if fd_pp != 0.0:          fd_arr[t0] = fd_pp / 100.0
+    if energy_pp != 0.0:      en_arr[t0] = energy_pp / 100.0
+    if nonenergy_pp != 0.0:   nen_arr[t0] = nonenergy_pp / 100.0
 
     # Persistence
     for arr in (is_arr, pc_arr, pol_arr, rr_arr, fd_arr, en_arr, nen_arr):
@@ -517,7 +529,7 @@ try:
             pi_star_quarterly = (annual_pct / 100.0) / 4.0
             st.info(f"π* set to {annual_pct:.2f}% annual ⇒ {pi_star_quarterly:.4f} quarterly (decimal)")
 
-        # Fit with selected regressors (with pass-through floor)
+        # Fit with enforced signs & Taylor principle
         models_o = fit_models_original(df_est, pi_star_quarterly, is_selected, pc_selected, tr_selected, mon_pass_floor_pp)
 
         # Warn if policy shock but Real_Rate_L1_data is excluded (kills transmission)
@@ -584,7 +596,7 @@ try:
 
         plt.tight_layout(); st.pyplot(fig)
 
-        # Readout
+        # Readout (if policy shock)
         if isinstance(shock_target, str) and "taylor" in shock_target.lower():
             delta_i_bp = (iS - i0)[shock_quarter] * 10000.0
             st.info(f"Δ policy rate at t={shock_quarter}: {delta_i_bp:.1f} bp  |  mode: {policy_mode}  |  ρ={rho_sim:.2f}")
@@ -615,8 +627,6 @@ try:
         # ===== LaTeX equations (display raw OLS) =====
         st.subheader("Estimated Equations (Original model)")
         m_is = models_o["model_is"]; m_pc = models_o["model_pc"]; m_tr = models_o["model_tr"]
-        alpha_star = models_o["alpha_star"]; rho_hat = models_o["rho_hat"]
-        phi_pi_star = models_o["phi_pi_star_sim"]; phi_g_star = models_o["phi_g_star_sim"]
 
         # IS
         is_terms = []
@@ -646,7 +656,7 @@ try:
         for k, v in m_pc.params.items():
             if k == "const": continue
             pc_terms.append((float(v), pretty_map_pc.get(k, k)))
-        st.markdown("**Phillips Curve (\\(\\Delta \\log CPI_t\\))**")
+        st.markdown("**Phillips Curve (\\(\\Delta \log CPI_t\\))**")
         st.latex(build_latex_equation(float(m_pc.params.get("const", 0.0)), pc_terms, r"\Delta \log CPI_t", r"u_t"))
 
         # Taylor rule
@@ -659,7 +669,7 @@ try:
             st.latex(r"i_t \;=\; \rho\, i_{t-1} \;+\; (1-\rho)\, i_t^\* \;+\; \varepsilon^{\text{pol}}_t \quad (\text{with local-jump override})")
 
         st.latex(r"i_t^\* \;=\; \alpha^\*_{\text{sim}} \;+\; \phi_{\pi}^\*\,(\pi_t - \pi^\*) \;+\; \phi_{g}^\*\,\big(g_t - \bar g\big)")
-        st.caption("Clips enforce: IS real-rate ≤ 0 (with floor), Phillips activity ≥ 0, Taylor φ’s ≥ 0; α* set so long-run equals the neutral rate.")
+        st.caption("Enforced: IS (RR≤0, Energy≤0, Non-energy≤0, FD≥0), Phillips (GDP≥0, lagged Energy≥0, lagged Non-energy≥0), Taylor principle (φπ* ≥ 1).")
 
     else:
         # =========================
@@ -741,7 +751,6 @@ except Exception as e:
 if export_ready and export_df is not None and export_filename:
     st.subheader("Download results")
 
-    # Try to build Excel; if no engine, offer CSV fallback
     excel_bytes = make_excel_bytes({"series": export_df, "shocks": shocks_df if shocks_df is not None else pd.DataFrame()})
 
     if excel_bytes is not None:
