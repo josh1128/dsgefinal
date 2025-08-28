@@ -4,10 +4,12 @@
 #   1) Original model (DSGE.xlsx): IS (DlogGDP), Phillips (Dlog_CPI), Taylor (Nominal rate)
 #      - Real rate uses lag 1: RR_{t-1} = i_{t-1} − π_{t-1}
 #      - Taylor uses inflation gap (π_t − π*)
-#      - Shocks: IS, Phillips, and Taylor (tightening/easing)
+#      - Shocks: IS, Phillips, Taylor + (NEW) RR, Foreign Demand, Energy, Non-Energy
 #      - Policy shock behavior selector
 #      - LaTeX equations shown below charts
 #      - Monetary transmission floor on IS real-rate coefficient (optional)
+#      - (NEW) Neutral rate slider used for Original long-run target & NK level plotting
+#      - (NEW) Export plotted data to Excel on desktop
 #   2) Simple NK (built-in)
 # -----------------------------------------------------------
 
@@ -19,6 +21,10 @@ import statsmodels.api as sm
 import streamlit as st
 import matplotlib.pyplot as plt
 from pathlib import Path
+import os
+
+# ===== Desktop export folder =====
+file_path = r'C:\Users\AC03537\OneDrive - Alberta Central\Desktop'
 
 # =========================
 # Page setup
@@ -126,7 +132,7 @@ with st.sidebar:
     neutral_rate_pct = st.number_input(
         "Neutral nominal policy rate — % annual",
         value=2.00, step=0.25, format="%.2f",
-        help="Used for NK level plotting."
+        help="Used for Original (long-run target) and NK (level plotting)."
     )
 
     if model_choice == "Original (DSGE.xlsx)":
@@ -145,7 +151,7 @@ with st.sidebar:
             target_annual_pct = st.slider("π* (annual %)", 0.0, 5.0, 2.0, 0.1)
         st.divider()
 
-        st.header("Shock")
+        st.header("Core shocks")
         shock_target = st.selectbox(
             "Apply shock to",
             ["None", "IS (Demand)", "Phillips (Supply)", "Taylor (Policy tightening)", "Taylor (Policy easing)"],
@@ -156,6 +162,13 @@ with st.sidebar:
         policy_shock_bp_abs = st.number_input("Policy shock size (absolute bp)", value=100, step=5, format="%d")
         shock_quarter = st.slider("Shock timing (t)", 1, T-1, 1, 1)
         shock_persist = st.slider("Shock persistence ρ_shock", 0.0, 0.95, 0.0, 0.05)
+
+        st.subheader("Additional shocks (optional)")
+        rr_shock_bp_abs = st.number_input("Real interest rate shock (bp, applied to RR_{t-1})", value=0, step=5, format="%d")
+        fd_shock_pp     = st.number_input("Foreign demand shock (pp, enters Dlog FD_Lag1 with lag)", value=0.00, step=0.05, format="%.2f")
+        energy_shock_pp = st.number_input("Energy shock (pp)", value=0.00, step=0.05, format="%.2f")
+        nonenergy_shock_pp = st.number_input("Non-energy shock (pp)", value=0.00, step=0.05, format="%.2f")
+        st.caption("Note: RR shock affects GDP at t+1 since IS uses RR_{t-1}. FD shock also appears with a lag.")
 
         st.header("Policy shock behavior")
         policy_mode = st.radio(
@@ -185,6 +198,10 @@ with st.sidebar:
             help="Floor on policy→activity: a 100 bp rate cut must raise quarterly GDP growth by at least this many **percentage points** (shows mainly at t+1 because IS uses RR_{t-1})."
         )
 
+        st.divider()
+        st.header("Export")
+        export_filename = st.text_input("Excel filename (saved to Desktop)", value="dsge_export.xlsx")
+
     else:
         st.info("**Mapping:** IS→(σ, ρx, ρr) • Phillips→(κ, γπ, ρu) • Taylor→(φπ, φx, ρi)")
         st.header("Simple NK parameters (pp units)")
@@ -206,8 +223,9 @@ with st.sidebar:
         shock_size_pp_nk = st.number_input("Shock size (pp)", value=1.00, step=0.25, format="%.2f")
         shock_quarter_nk = st.slider("Shock timing t", 1, T-1, 1, 1)
         shock_persist_nk = st.slider("Shock persistence ρ_shock", 0.0, 0.98, 0.80, 0.02)
-        # Plot the NK rate in **decimal** when showing level:
         units_mode = st.radio("NK policy rate units", ["Deviation (pp)", "Level (decimal)"], index=1)
+        st.divider()
+        export_filename = st.text_input("Excel filename (saved to Desktop)", value="nk_export.xlsx")
 
 # =========================
 # ORIGINAL MODEL (DSGE.xlsx)
@@ -331,32 +349,54 @@ def fit_models_original(df_est: pd.DataFrame, pi_star_quarterly: float,
         "p_ss": p_ss, "g_ss": g_ss
     }
 
-def build_shocks_original(T, target, is_size_pp, pc_size_pp, policy_bp_abs, t0, rho):
+def build_shocks_original(
+    T: int, target: str,
+    is_size_pp: float, pc_size_pp: float, policy_bp_abs: int,
+    rr_bp_abs: int, fd_pp: float, energy_pp: float, nonenergy_pp: float,
+    t0: int, rho: float
+):
+    """Return arrays for all shocks. Units: pp inputs are converted to decimals for model internals; bp to decimal."""
     is_arr = np.zeros(T); pc_arr = np.zeros(T); pol_arr = np.zeros(T)
+    rr_arr = np.zeros(T); fd_arr = np.zeros(T); en_arr = np.zeros(T); nen_arr = np.zeros(T)
+
+    # Core shocks
     target_norm = (target or "None").strip().lower()
     if target_norm == "is (demand)".lower():
         is_arr[t0] = is_size_pp / 100.0
-        for k in range(t0 + 1, T): is_arr[k] = rho * is_arr[k - 1]
     elif target_norm == "phillips (supply)".lower():
         pc_arr[t0] = pc_size_pp / 100.0
-        for k in range(t0 + 1, T): pc_arr[k] = rho * pc_arr[k - 1]
     elif target_norm == "taylor (policy tightening)".lower():
         pol_arr[t0] =  (policy_bp_abs / 10000.0)
-        for k in range(t0 + 1, T): pol_arr[k] = rho * pol_arr[k - 1]
     elif target_norm == "taylor (policy easing)".lower():
         pol_arr[t0] = -(policy_bp_abs / 10000.0)
-        for k in range(t0 + 1, T): pol_arr[k] = rho * pol_arr[k - 1]
-    return is_arr, pc_arr, pol_arr
+
+    # Additional shocks
+    if rr_bp_abs != 0:
+        rr_arr[t0] = rr_bp_abs / 10000.0  # decimal
+    if fd_pp != 0.0:
+        fd_arr[t0] = fd_pp / 100.0        # decimal
+    if energy_pp != 0.0:
+        en_arr[t0] = energy_pp / 100.0    # decimal
+    if nonenergy_pp != 0.0:
+        nen_arr[t0] = nonenergy_pp / 100.0
+
+    # Persistence
+    for arr in (is_arr, pc_arr, pol_arr, rr_arr, fd_arr, en_arr, nen_arr):
+        for k in range(t0 + 1, T):
+            arr[k] = rho * arr[k - 1]
+
+    return is_arr, pc_arr, pol_arr, rr_arr, fd_arr, en_arr, nen_arr
 
 def simulate_original(
     T: int, rho_sim: float, df_est: pd.DataFrame,
     models: Dict[str, sm.regression.linear_model.RegressionResultsWrapper],
     means: Dict[str, float], i_mean_dec: float, real_rate_mean_dec: float,
-    pi_star_quarterly: float, is_shock_arr=None, pc_shock_arr=None, policy_shock_arr=None,
+    pi_star_quarterly: float,
+    is_shock_arr=None, pc_shock_arr=None, policy_shock_arr=None,
+    rr_shock_arr=None, fd_shock_arr=None, energy_shock_arr=None, nonenergy_shock_arr=None,
     policy_mode: str = "Add after smoothing (standard)", neutral_dec: float = 0.02
 ):
-    """Forward-simulate GDP growth (g), inflation (p), and the nominal rate (i).
-       Units: g & p in decimals internally; i in decimals."""
+    """Forward-simulate g (DlogGDP), p (DlogCPI), i (policy rate). Internals: g,p in decimals; i in decimal."""
     g = np.zeros(T); p = np.zeros(T); i = np.zeros(T)
     g[0] = float(df_est["DlogGDP"].mean())
     p[0] = float(df_est["Dlog_CPI"].mean())
@@ -368,25 +408,39 @@ def simulate_original(
     phi_g_star_sim  = models.get("phi_g_star_sim",  np.nan)
     p_ss = models["p_ss"]; g_ss = models["g_ss"]
 
+    # Default zeros
     if is_shock_arr is None: is_shock_arr = np.zeros(T)
     if pc_shock_arr is None: pc_shock_arr = np.zeros(T)
     if policy_shock_arr is None: policy_shock_arr = np.zeros(T)
+    if rr_shock_arr is None: rr_shock_arr = np.zeros(T)
+    if fd_shock_arr is None: fd_shock_arr = np.zeros(T)
+    if energy_shock_arr is None: energy_shock_arr = np.zeros(T)
+    if nonenergy_shock_arr is None: nonenergy_shock_arr = np.zeros(T)
 
     # Intercept so long-run equals chosen neutral rate
     alpha_star_sim = neutral_dec - (0.0 if np.isnan(phi_pi_star_sim) else phi_pi_star_sim) * (p_ss - pi_star_quarterly)
 
     for t in range(1, T):
-        # Real rate with 1-quarter lag (decimal)
-        rr_lag1 = (i[t - 1] - p[t - 1]) if t >= 1 else real_rate_mean_dec
+        # Real rate with 1-quarter lag (decimal) + optional shock (applied to RR_{t-1})
+        rr_extra = rr_shock_arr[t - 1] if t >= 1 else 0.0
+        rr_lag1 = (i[t - 1] - p[t - 1]) + rr_extra
+
+        # Build exogenous terms (means + shocks; respect lags where applicable)
+        fd_val   = means["Dlog FD_Lag1"] + (fd_shock_arr[t - 1] if t >= 1 else 0.0)     # enters as _Lag1
+        enr_val  = means["Dlog_Energy"] + energy_shock_arr[t]                            # contemporaneous
+        nren_val = means["Dlog_NonEnergy"] + nonenergy_shock_arr[t]                      # contemporaneous
+
+        enr_l1_val  = means["Dlog_Energy_L1"] + (energy_shock_arr[t - 1] if t >= 1 else 0.0)
+        nren_l1_val = means["Dlog_Non_Energy_L1"] + (nonenergy_shock_arr[t - 1] if t >= 1 else 0.0)
 
         # IS (g_t)
         vals_is = {
             "DlogGDP_L1": g[t - 1],
             "Real_Rate_L1_data": rr_lag1,
-            "Dlog FD_Lag1": means["Dlog FD_Lag1"],
+            "Dlog FD_Lag1": fd_val,
             "Dlog_REER": means["Dlog_REER"],
-            "Dlog_Energy": means["Dlog_Energy"],
-            "Dlog_NonEnergy": means["Dlog_NonEnergy"],
+            "Dlog_Energy": enr_val,
+            "Dlog_NonEnergy": nren_val,
         }
         Xis = row_from_params(model_is.params.index, vals_is)
         g[t] = predict_with_params(Xis, beta_is_sim) + is_shock_arr[t]
@@ -396,8 +450,8 @@ def simulate_original(
             "Dlog_CPI_L1": p[t - 1],
             "DlogGDP_L1": g[t - 1],
             "Dlog_Reer_L2": means["Dlog_Reer_L2"],
-            "Dlog_Energy_L1": means["Dlog_Energy_L1"],
-            "Dlog_Non_Energy_L1": means["Dlog_Non_Energy_L1"],
+            "Dlog_Energy_L1": enr_l1_val,
+            "Dlog_Non_Energy_L1": nren_l1_val,
         }
         Xpc = row_from_params(model_pc.params.index, vals_pc)
         p[t] = predict_with_params(Xpc, beta_pc_sim) + pc_shock_arr[t]
@@ -426,6 +480,10 @@ def simulate_original(
 # Run selected model
 # =========================
 try:
+    export_ready = False
+    export_df = None
+    shocks_df = None
+
     if model_choice == "Original (DSGE.xlsx)":
         file_source = xlf if 'xlf' in locals() and xlf is not None else (fallback if 'fallback' in locals() else None)
         df_all, df_est = load_and_prepare_original(file_source)
@@ -461,8 +519,11 @@ try:
         }
 
         # Build shocks & simulate
-        is_arr, pc_arr, pol_arr = build_shocks_original(
-            T, shock_target, is_shock_size_pp, pc_shock_size_pp, policy_shock_bp_abs, shock_quarter, shock_persist
+        t0 = shock_quarter  # same indexing as your plotting line
+        is_arr, pc_arr, pol_arr, rr_arr, fd_arr, en_arr, nen_arr = build_shocks_original(
+            T, shock_target, is_shock_size_pp, pc_shock_size_pp, policy_shock_bp_abs,
+            rr_shock_bp_abs, fd_shock_pp, energy_shock_pp, nonenergy_shock_pp,
+            t0, shock_persist
         )
         neutral_dec = neutral_rate_pct / 100.0
 
@@ -473,6 +534,7 @@ try:
         gS, pS, iS = simulate_original(
             T, rho_sim, df_est, models_o, means_o, i_mean_dec, real_rate_mean_dec, pi_star_quarterly,
             is_shock_arr=is_arr, pc_shock_arr=pc_arr, policy_shock_arr=pol_arr,
+            rr_shock_arr=rr_arr, fd_shock_arr=fd_arr, energy_shock_arr=en_arr, nonenergy_shock_arr=nen_arr,
             policy_mode=policy_mode, neutral_dec=neutral_dec
         )
 
@@ -507,6 +569,28 @@ try:
             delta_i_bp = (iS - i0)[shock_quarter] * 10000.0
             st.info(f"Δ policy rate at t={shock_quarter}: {delta_i_bp:.1f} bp  |  mode: {policy_mode}  |  ρ={rho_sim:.2f}")
             st.caption("Policy affects GDP at **t+1** (IS uses RR_{t-1}).")
+
+        # ===== Prepare export data =====
+        export_df = pd.DataFrame({
+            "quarter": quarters,
+            "g_baseline_pct": g0 * 100.0,
+            "g_shock_pct":    gS * 100.0,
+            "p_baseline_pct": p0 * 100.0,
+            "p_shock_pct":    pS * 100.0,
+            "i_baseline_dec": i0,
+            "i_shock_dec":    iS,
+        })
+        shocks_df = pd.DataFrame({
+            "quarter": quarters,
+            "is_shock_dec": is_arr,
+            "pc_shock_dec": pc_arr,
+            "policy_shock_dec": pol_arr,
+            "rr_shock_dec": rr_arr,
+            "fd_shock_dec": fd_arr,
+            "energy_shock_dec": en_arr,
+            "nonenergy_shock_dec": nen_arr,
+        })
+        export_ready = True
 
         # ===== LaTeX equations (display raw OLS) =====
         st.subheader("Estimated Equations (Original model)")
@@ -611,12 +695,38 @@ try:
 
         plt.tight_layout(); st.pyplot(fig)
 
-        with st.expander("Simple NK equations"):
-            st.latex(r"x_t = \rho_x x_{t-1} \;-\; \frac{1}{\sigma}\big( i_t - \pi_{t+1} - r^n_t \big)")
-            st.latex(r"\pi_t = \gamma_\pi \pi_{t-1} \;+\; \kappa x_t \;+\; u_t")
-            st.latex(r"i_t = \rho_i i_{t-1} \;+\; (1-\rho_i)(\phi_\pi \pi_t + \phi_x x_t) \;+\; \varepsilon^i_t")
+        # Export for NK
+        export_df = pd.DataFrame({
+            "quarter": h,
+            "x_baseline_pp": x0, "x_shock_pp": xS,
+            "pi_baseline_pp": pi0, "pi_shock_pp": piS,
+            "i_baseline_plot": i0_plot, "i_shock_plot": iS_plot,
+            "i_baseline_dev_pp": i0, "i_shock_dev_pp": iS,
+        })
+        shocks_df = pd.DataFrame({
+            "shock_type": [shock_type_nk],
+            "shock_size_pp": [shock_size_pp_nk],
+            "shock_t0": [t0],
+            "shock_persistence": [rho_for_shock],
+        })
+        export_ready = True
 
 except Exception as e:
     st.error(f"Problem loading or running the selected model: {e}")
     st.stop()
+
+# =========================
+# Export button
+# =========================
+if export_ready and export_df is not None and export_filename:
+    export_fullpath = os.path.join(file_path, export_filename)
+    if st.button("Export current chart data to Excel"):
+        try:
+            with pd.ExcelWriter(export_fullpath, engine="xlsxwriter") as writer:
+                export_df.to_excel(writer, sheet_name="series", index=False)
+                if shocks_df is not None:
+                    shocks_df.to_excel(writer, sheet_name="shocks", index=False)
+            st.success(f"Exported to: {export_fullpath}")
+        except Exception as ex:
+            st.error(f"Failed to export to Excel: {ex}")
 
