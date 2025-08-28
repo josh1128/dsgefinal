@@ -325,15 +325,15 @@ def fit_models_original(df_est: pd.DataFrame, pi_star_quarterly: float,
     if "Dlog FD_Lag1" in X_is.columns:   rules_is["Dlog FD_Lag1"] = "nonneg"
     beta_is_sim = _clip_and_recentre(model_is.params, X_is_means, rules=rules_is)
 
-# Pass-through floor: 100bp cut → ≥ mon_pass_floor_pp pp ↑ in growth
-floor_abs = (mon_pass_floor_pp / 100.0) / 0.01  # pp→decimal / 0.01
-if "Real_Rate_L1_data" in beta_is_sim.index:
-    current = float(beta_is_sim["Real_Rate_L1_data"])
-    desired = -max(abs(current), floor_abs)
-    if desired != current:
-        mean_rr = float(X_is_means.get("Real_Rate_L1_data", 0.0))
-        beta_is_sim["const"] = float(beta_is_sim.get("const", 0.0)) + (current - desired) * mean_rr
-        beta_is_sim["Real_Rate_L1_data"] = desired
+    # Pass-through floor: 100bp cut → ≥ mon_pass_floor_pp pp ↑ in growth
+    floor_abs = (mon_pass_floor_pp / 100.0) / 0.01  # pp→decimal / 0.01
+    if "Real_Rate_L1_data" in beta_is_sim.index:
+        current = float(beta_is_sim["Real_Rate_L1_data"])
+        desired = -max(abs(current), floor_abs)
+        if desired != current:
+            mean_rr = float(X_is_means.get("Real_Rate_L1_data", 0.0))
+            beta_is_sim["const"] = float(beta_is_sim.get("const", 0.0)) + (current - desired) * mean_rr
+            beta_is_sim["Real_Rate_L1_data"] = desired
 
     # ---------- Phillips ----------
     if not pc_selected:
